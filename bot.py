@@ -1,305 +1,388 @@
-# Telegram Crypto Signals Bot
-# This script creates a Telegram bot that provides crypto trading signals based on TradingView analysis.
-# It uses tradingview_ta for signals, ccxt for price data, plotly for chart generation with annotations.
-# Daily news scraping from Cointelegraph and posting to channel.
-# Daily random trade post for a popular coin.
-# Monitors open trades for TP/SL hits (simple polling in a thread).
-# Futuristic features added:
-#   - Sentiment analysis on news using NLTK to influence signal confidence.
-#   - Basic price prediction using linear regression from scikit-learn.
-#   - AI-like advice generation based on analysis.
-# User needs to install dependencies: pip install telebot tradingview_ta ccxt pandas plotly requests beautifulsoup4 nltk scikit-learn schedule
-# Also, download NLTK data: in code.
-# Set BOT_TOKEN and CHANNEL_USERNAME (e.g., '@yourchannel' or chat_id as int).
+# ===========================
+# TELEGRAM BOT - PRIVATE ONLY
+# Library: pyTelegramBotAPI
+# ===========================
 
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import tradingview_ta
-from tradingview_ta import TA_Handler, Interval, Exchange
-import ccxt
-import pandas as pd
-import plotly.graph_objects as go
-from io import BytesIO
-import requests
-from bs4 import BeautifulSoup
-import nltk
-from nltk.sentiment import SentimentIntensityAnalyzer
-from sklearn.linear_model import LinearRegression
-import numpy as np
+from telebot import types
 import threading
 import time
-import schedule
 import random
-import os
+from datetime import datetime, timedelta
+import pytz
+from flask import Flask
 
-# Download NLTK data if not present
-nltk.download('vader_lexicon', quiet=True)
+# ===========================
+# HARD-CODED CONFIG
+# ===========================
+BOT_TOKEN = "7760766537:AAEq7YHiUajTO7Vkpp3Wz-9o0fmEoLUMH_o"
+ADMIN_ID = 1319884774
 
-# Configuration - Replace with your values
-BOT_TOKEN = os.getenv('BOT_TOKEN')  # Use environment variable
-CHANNEL_LINK = 'https://t.me/+T2lFw-AjK21kYWM0'
-BINANCE_LINK = 'https://www.binance.com/referral/earn-together/refer-in-hotsummer/claim?hl=en&ref=GRO_20338_LRBY5&utm_source=default'
-CHANNEL_USERNAME = '@your_channel_username'  # Or chat_id as int, e.g., -1001234567890. Bot must be admin in channel.
-POPULAR_COINS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT']  # List of coins for daily posts
+MAIN_CHANNEL = "@minahil_malik_viral_vids"
+MAIN_CHANNEL_LINK = "https://t.me/minahil_malik_viral_vids"
+BACKUP_CHANNEL = "@paki_leaks_here"
+BACKUP_CHANNEL_LINK = "https://t.me/paki_leaks_here"
 
-bot = telebot.TeleBot(BOT_TOKEN)
-exchange = ccxt.binance()
-sia = SentimentIntensityAnalyzer()
+TZ = pytz.timezone("Asia/Karachi")
 
-# Store open trades for monitoring {user_id: [{'symbol': 'BTCUSDT', 'entry': 50000, 'tps': [51000,52000,...], 'hit_tps': [], 'sl': 49000, 'type': 'long'}]}
-open_trades = {}
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Function to get current price
-def get_current_price(symbol):
-    ticker = exchange.fetch_ticker(symbol)
-    return ticker['last']
+# ===========================
+# FLASK KEEP-ALIVE
+# ===========================
+app = Flask(__name__)
 
-# Function to perform analysis using TradingView TA
-def get_ta_analysis(symbol):
-    handler = TA_Handler(
-        symbol=symbol.replace('USDT', '/USDT'),
-        screener="crypto",
-        exchange="BINANCE",
-        interval=Interval.INTERVAL_1_HOUR
-    )
-    analysis = handler.get_analysis()
-    return analysis
+@app.route("/")
+def home():
+    return "Bot is alive."
 
-# Futuristic: Simple price prediction using linear regression on last 30 candles
-def predict_price(symbol):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=30)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    X = np.array(range(len(df))).reshape(-1, 1)
-    y = df['close'].values
-    model = LinearRegression().fit(X, y)
-    future = np.array([[len(df) + 1]])
-    predicted = model.predict(future)[0]
-    return predicted
+def run_flask():
+    app.run(host="0.0.0.0", port=8080)
 
-# Generate signal based on TA
-def generate_signal(symbol):
-    analysis = get_ta_analysis(symbol)
-    rec = analysis.summary['RECOMMENDATION']
-    if rec in ['BUY', 'STRONG_BUY']:
-        direction = 'Long'
-    elif rec in ['SELL', 'STRONG_SELL']:
-        direction = 'Short'
-    else:
-        return None  # Neutral, no signal
+threading.Thread(target=run_flask, daemon=True).start()
 
-    current_price = get_current_price(symbol)
-    predicted = predict_price(symbol)
-    volatility = analysis.indicators.get('Volatility', 0.02)  # Approximate
+# ===========================
+# GLOBAL STATE
+# ===========================
+known_users = set()
+feedback_mode = set()
 
-    if direction == 'Long':
-        entry = current_price
-        sl = entry * (1 - volatility)
-        tps = [entry * (1 + 0.01 * i) for i in range(1, 6)]
-    else:
-        entry = current_price
-        sl = entry * (1 + volatility)
-        tps = [entry * (1 - 0.01 * i) for i in range(1, 6)]
+temp_broadcast = {
+    "active": False,
+    "text": None,
+    "end_time": None
+}
 
-    advice = f"Based on AI analysis, predicted price: {predicted:.2f}. Sentiment score: {analysis.indicators.get('RSI', 50)}. Trade with caution, manage risk."
+saved_media = None
+saved_media_type = None
 
-    return {
-        'direction': direction,
-        'entry': entry,
-        'tps': tps,
-        'sl': sl,
-        'advice': advice
-    }
+custom_words = {}      # word -> dict
+giveaway = {
+    "active": False,
+    "participants": set(),
+    "end_time": None,
+    "winners": 1
+}
 
-# Generate chart image with annotations, optional hit_tps for highlighting
-def generate_chart_image(symbol, entry, tps, sl, direction, hit_tps=None):
-    if hit_tps is None:
-        hit_tps = []
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+# ===========================
+# UTILITIES
+# ===========================
+def now_pkt():
+    return datetime.now(TZ)
 
-    fig = go.Figure(data=[go.Candlestick(x=df['timestamp'],
-                                        open=df['open'],
-                                        high=df['high'],
-                                        low=df['low'],
-                                        close=df['close'])])
+def is_admin(uid):
+    return uid == ADMIN_ID
 
-    # Add entry line
-    fig.add_hline(y=entry, line_dash="dash", line_color="blue", annotation_text="Entry")
+def private_only(message):
+    return message.chat.type == "private"
 
-    # Add SL red box (rectangle from last candle to SL)
-    last_time = df['timestamp'].iloc[-1]
-    fig.add_shape(type="rect",
-                  x0=last_time, y0=min(entry, sl), x1=last_time + pd.Timedelta(hours=24), y1=max(entry, sl),
-                  fillcolor="red", opacity=0.3, line_color="red")
+def join_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Join Main Channel", url=MAIN_CHANNEL_LINK))
+    kb.add(types.InlineKeyboardButton("Join Backup Channel", url=BACKUP_CHANNEL_LINK))
+    return kb
 
-    # Add green boxes for remaining TPs
-    for tp in tps:
-        fig.add_shape(type="rect",
-                      x0=last_time, y0=tp - 0.001*tp, x1=last_time + pd.Timedelta(hours=24), y1=tp + 0.001*tp,
-                      fillcolor="green", opacity=0.3, line_color="green")
-        fig.add_hline(y=tp, line_dash="dot", line_color="green")
+def feedback_button():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("💬 Feedback", callback_data="feedback"))
+    return kb
 
-    # Add yellow lines for hit TPs
-    for hit_tp in hit_tps:
-        fig.add_hline(y=hit_tp, line_dash="solid", line_color="yellow", annotation_text="Hit TP")
-
-    fig.update_layout(title=f"{symbol} Chart", xaxis_title="Time", yaxis_title="Price", showlegend=False)
-
-    img_bytes = fig.to_image(format="png")
-    return BytesIO(img_bytes)
-
-# Scrape crypto news
-def scrape_news():
-    url = 'https://cointelegraph.com/'
-    response = requests.get(url)
-    soup = BeautifulSoup(response.text, 'html.parser')
-    articles = soup.find_all('a', class_='post-card__title-link', limit=5)
-    news = []
-    for article in articles:
-        title = article.text.strip()
-        link = 'https://cointelegraph.com' + article['href']
-        # Get image if available
-        img_tag = article.find_parent().find('img')
-        img_url = img_tag['src'] if img_tag else None
-        news.append({'title': title, 'link': link, 'img_url': img_url})
-    return news
-
-# Futuristic: Analyze news sentiment
-def analyze_news_sentiment(news):
-    sentiments = [sia.polarity_scores(item['title'])['compound'] for item in news]
-    avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0
-    return avg_sentiment
-
-# Daily news post
-def post_daily_news():
-    news = scrape_news()
-    sentiment = analyze_news_sentiment(news)
-    message = f"Daily Crypto News (AI Sentiment: {sentiment:.2f}):\n"
-    for item in news:
-        message += f"- {item['title']} {item['link']}\n"
-    
-    bot.send_message(CHANNEL_USERNAME, message)
-    # Send images if available
-    for item in news:
-        if item['img_url']:
-            bot.send_photo(CHANNEL_USERNAME, item['img_url'], caption=item['title'])
-
-# Daily trade post
-def post_daily_trade():
-    symbol = random.choice(POPULAR_COINS)
-    signal = generate_signal(symbol)
-    if not signal:
-        return  # No signal
-
-    message = f"Daily Confirmed Trade: {symbol} - {signal['direction']}\n"
-    message += f"Entry: {signal['entry']:.2f}\n"
-    for i, tp in enumerate(signal['tps'], 1):
-        message += f"TP{i}: {tp:.2f}\n"
-    message += f"SL: {signal['sl']:.2f}\n"
-    message += f"Small Advice: {signal['advice']}\n"
-
-    img = generate_chart_image(symbol, signal['entry'], signal['tps'], signal['sl'], signal['direction'])
-    bot.send_photo(CHANNEL_USERNAME, img, caption=message)
-
-# Monitor trades for TP/SL hits
-def monitor_trades():
-    while True:
-        for user_id, trades in list(open_trades.items()):
-            for trade in trades[:]:  # Copy to avoid modification during iteration
-                current = get_current_price(trade['symbol'])
-                if trade['type'] == 'long':
-                    if current <= trade['sl']:
-                        message = f"SL hit for {trade['symbol']}! Loss. Advice: Review strategy."
-                        bot.send_message(user_id, message)
-                        trades.remove(trade)
-                    else:
-                        for tp in trade['tps'][:]:
-                            if current >= tp:
-                                congrats_message = f"TP hit for {trade['symbol']} at {tp}! Congratulations! 🎉 Small Advice: Book profits and consider trailing the remaining stops."
-                                bot.send_message(user_id, congrats_message)
-                                bot.send_message(CHANNEL_USERNAME, congrats_message)
-                                trade['hit_tps'].append(tp)
-                                trade['tps'].remove(tp)
-                                # Generate updated chart with hit TPs highlighted
-                                img = generate_chart_image(trade['symbol'], trade['entry'], trade['tps'], trade['sl'], trade['type'].capitalize(), trade['hit_tps'])
-                                bot.send_photo(user_id, img, caption="Updated Chart after TP hit")
-                                bot.send_photo(CHANNEL_USERNAME, img, caption="Updated Chart after TP hit")
-                else:  # Short
-                    if current >= trade['sl']:
-                        message = f"SL hit for {trade['symbol']}! Loss. Advice: Review strategy."
-                        bot.send_message(user_id, message)
-                        trades.remove(trade)
-                    else:
-                        for tp in trade['tps'][:]:
-                            if current <= tp:
-                                congrats_message = f"TP hit for {trade['symbol']} at {tp}! Congratulations! 🎉 Small Advice: Book profits and consider trailing the remaining stops."
-                                bot.send_message(user_id, congrats_message)
-                                bot.send_message(CHANNEL_USERNAME, congrats_message)
-                                trade['hit_tps'].append(tp)
-                                trade['tps'].remove(tp)
-                                # Generate updated chart with hit TPs highlighted
-                                img = generate_chart_image(trade['symbol'], trade['entry'], trade['tps'], trade['sl'], trade['type'].capitalize(), trade['hit_tps'])
-                                bot.send_photo(user_id, img, caption="Updated Chart after TP hit")
-                                bot.send_photo(CHANNEL_USERNAME, img, caption="Updated Chart after TP hit")
-        time.sleep(60)  # Check every minute
-
-# Schedule daily tasks
-def run_scheduler():
-    schedule.every().day.at("09:00").do(post_daily_news)
-    schedule.every().day.at("10:00").do(post_daily_trade)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-# Bot handlers
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("Join Channel", url=CHANNEL_LINK))
-    bot.send_message(message.chat.id, "Please join my channel first to get signals:", reply_markup=markup)
-    bot.send_message(message.chat.id, f"Binance Joining Link: {BINANCE_LINK}")
-    bot.send_message(message.chat.id, "Now you can use /trade <symbol> e.g., /trade BTCUSDT")
-
-@bot.message_handler(commands=['trade'])
-def handle_trade(message):
+def must_join_check(message):
+    if is_admin(message.from_user.id):
+        return True
     try:
-        symbol = message.text.split()[1].upper() + 'USDT' if not message.text.split()[1].endswith('USDT') else message.text.split()[1].upper()
-    except IndexError:
-        bot.reply_to(message, "Usage: /trade <symbol> e.g., /trade BTC")
+        m1 = bot.get_chat_member(MAIN_CHANNEL, message.from_user.id)
+        m2 = bot.get_chat_member(BACKUP_CHANNEL, message.from_user.id)
+        if m1.status in ["left", "kicked"] or m2.status in ["left", "kicked"]:
+            bot.reply_to(
+                message,
+                "Bot use karne ke liye pehle dono channels join karo!",
+                reply_markup=join_keyboard()
+            )
+            return False
+    except:
+        bot.reply_to(
+            message,
+            "Bot use karne ke liye pehle dono channels join karo!",
+            reply_markup=join_keyboard()
+        )
+        return False
+    return True
+
+def log_admin(text):
+    try:
+        bot.send_message(ADMIN_ID, text)
+    except:
+        pass
+
+# ===========================
+# /START
+# ===========================
+@bot.message_handler(commands=["start"])
+def start_cmd(message):
+    if not private_only(message):
+        return
+    known_users.add(message.from_user.id)
+
+    if not must_join_check(message):
         return
 
-    signal = generate_signal(symbol)
-    if not signal:https://github.com/jawadilvl81-gif/jawadi--new/tree/main
-        bot.reply_to(message, "No clear signal right now. Try later.")
+    bot.send_message(
+        message.chat.id,
+        "Welcome! Bot ready hai. ✅",
+        reply_markup=feedback_button()
+    )
+
+# ===========================
+# /HELP (ADMIN ONLY)
+# ===========================
+@bot.message_handler(commands=["help"])
+def help_cmd(message):
+    if not private_only(message):
+        return
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Ye command sirf admin ke liye hai!")
         return
 
-    message_text = f"Confirmed Trade: {symbol} - {signal['direction']}\n"
-    message_text += f"Entry: {signal['entry']:.2f}\n"
-    for i, tp in enumerate(signal['tps'], 1):
-        message_text += f"TP{i}: {tp:.2f}\n"
-    message_text += f"SL: {signal['sl']:.2f}\n"
-    message_text += f"Small Advice: {signal['advice']}\n"
+    help_text = (
+        "<b>ADMIN COMMANDS</b>\n\n"
+        "/allmembers <text> (ya media reply)\n"
+        "→ Sab users ko broadcast\n\n"
+        "/notify <text> <minutes>\n"
+        "→ Temporary broadcast\n\n"
+        "/stop\n"
+        "→ Temporary broadcast stop\n\n"
+        "/channel <text> <delay_minutes>\n"
+        "→ Channel scheduled post\n\n"
+        "/channel_now <text>\n"
+        "→ Channel instant post\n\n"
+        "/members <minutes>\n"
+        "→ Saved media broadcast\n\n"
+        "/giveaway all <minutes> <winners>\n"
+        "→ Giveaway start\n\n"
+        "/my <word>\n"
+        "→ Custom word setup\n\n"
+        "/all <my_word>\n"
+        "→ Word-based broadcast\n\n"
+        "/stats\n"
+        "/stats channel\n"
+        "/mention <limit> <minutes> <total>\n"
+    )
+    bot.send_message(message.chat.id, help_text)
 
-    img = generate_chart_image(symbol, signal['entry'], signal['tps'], signal['sl'], signal['direction'])
+# ===========================
+# /ALLMEMBERS
+# ===========================
+@bot.message_handler(commands=["allmembers"])
+def allmembers_cmd(message):
+    if not private_only(message):
+        return
+    if not is_admin(message.from_user.id):
+        return
 
-    bot.send_photo(message.chat.id, img, caption=message_text)
+    if message.reply_to_message and message.reply_to_message.content_type != "text":
+        for uid in list(known_users):
+            try:
+                bot.copy_message(
+                    uid,
+                    message.chat.id,
+                    message.reply_to_message.message_id,
+                    reply_markup=feedback_button()
+                )
+            except:
+                pass
+    else:
+        text = message.text.replace("/allmembers", "").strip()
+        for uid in list(known_users):
+            try:
+                bot.send_message(uid, text, reply_markup=feedback_button())
+            except:
+                pass
 
-    # Add to open trades for monitoring
-    if message.chat.id not in open_trades:
-        open_trades[message.chat.id] = []
-    open_trades[message.chat.id].append({
-        'symbol': symbol,
-        'entry': signal['entry'],
-        'tps': signal['tps'][:],  # Copy list
-        'hit_tps': [],  # List for hit TPs
-        'sl': signal['sl'],
-        'type': signal['direction'].lower()
-    })
+    bot.reply_to(message, "Message/media sab users ko bhej diya!")
 
-# Start monitoring and scheduler in threads
-threading.Thread(target=monitor_trades, daemon=True).start()
-threading.Thread(target=run_scheduler, daemon=True).start()
+# ===========================
+# /NOTIFY & /STOP
+# ===========================
+@bot.message_handler(commands=["notify"])
+def notify_cmd(message):
+    if not private_only(message):
+        return
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        bot.reply_to(message, "Example: /notify Hello 5")
+        return
 
-# Start bot
-bot.infinity_polling()
+    minutes = int(parts[-1])
+    text = " ".join(parts[1:-1])
+
+    temp_broadcast["active"] = True
+    temp_broadcast["text"] = text
+    temp_broadcast["end_time"] = now_pkt() + timedelta(minutes=minutes)
+
+    def notifier():
+        while temp_broadcast["active"]:
+            if now_pkt() >= temp_broadcast["end_time"]:
+                temp_broadcast["active"] = False
+                break
+            time.sleep(5)
+
+    threading.Thread(target=notifier, daemon=True).start()
+    bot.reply_to(message, "Temporary broadcast start ho gaya.")
+
+@bot.message_handler(commands=["stop"])
+def stop_cmd(message):
+    if is_admin(message.from_user.id):
+        temp_broadcast["active"] = False
+        bot.reply_to(message, "Temporary broadcast stop kar diya.")
+
+# ===========================
+# /CHANNEL POSTS
+# ===========================
+@bot.message_handler(commands=["channel"])
+def channel_cmd(message):
+    if not private_only(message):
+        return
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split()
+    delay = int(parts[-1])
+    text = " ".join(parts[1:-1])
+
+    def post_later():
+        time.sleep(delay * 60)
+        bot.send_message(MAIN_CHANNEL, text, disable_web_page_preview=True)
+
+    threading.Thread(target=post_later, daemon=True).start()
+    bot.reply_to(message, f"Post schedule ho gaya ({delay} min). PKT time.")
+
+@bot.message_handler(commands=["channel_now"])
+def channel_now_cmd(message):
+    if is_admin(message.from_user.id):
+        text = message.text.replace("/channel_now", "").strip()
+        bot.send_message(MAIN_CHANNEL, text, disable_web_page_preview=True)
+        bot.reply_to(message, "Channel pe post ho gaya.")
+
+# ===========================
+# GIVEAWAY
+# ===========================
+@bot.message_handler(commands=["giveaway"])
+def giveaway_cmd(message):
+    if not private_only(message):
+        return
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        bot.reply_to(message, "Example: /giveaway all 5 1")
+        return
+
+    minutes = int(parts[-2])
+    winners = int(parts[-1]) if parts[-1].isdigit() else 1
+
+    giveaway["active"] = True
+    giveaway["participants"].clear()
+    giveaway["end_time"] = now_pkt() + timedelta(minutes=minutes)
+    giveaway["winners"] = winners
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Participate 🎉", callback_data="join_giveaway"))
+
+    announce = (
+        "🎁 <b>GIVEAWAY ALERT</b> 🎁\n\n"
+        f"⏳ Time: {minutes} minutes\n"
+        f"🏆 Winners: {winners}\n\n"
+        "Participate karne ke liye button dabao ya 'yes' bhejo!"
+    )
+
+    for uid in list(known_users):
+        try:
+            bot.send_message(uid, announce, reply_markup=kb)
+        except:
+            pass
+
+    bot.send_message(MAIN_CHANNEL, announce, reply_markup=kb)
+    bot.reply_to(message, "Giveaway start ho gaya!")
+
+    def end_giveaway():
+        while now_pkt() < giveaway["end_time"]:
+            time.sleep(60)
+        giveaway["active"] = False
+
+        plist = list(giveaway["participants"])
+        if winners > 0 and plist:
+            selected = random.sample(plist, min(winners, len(plist)))
+        else:
+            selected = []
+
+        for uid in selected:
+            try:
+                bot.send_message(uid, "🏆 Mubarak ho! Aap giveaway jeet gaye! 😍")
+            except:
+                pass
+
+        log_admin(
+            "Giveaway ended!\nWinners:\n" +
+            "\n".join([f"{uid}" for uid in selected])
+        )
+
+    threading.Thread(target=end_giveaway, daemon=True).start()
+
+@bot.callback_query_handler(func=lambda c: c.data == "join_giveaway")
+def join_giveaway_cb(call):
+    uid = call.from_user.id
+    giveaway["participants"].add(uid)
+    bot.answer_callback_query(call.id, "Participated successfully! 😍🥳")
+    log_admin(f"User @{call.from_user.username} (ID: {uid}) ne participated kia.")
+
+# ===========================
+# FEEDBACK SYSTEM
+# ===========================
+@bot.callback_query_handler(func=lambda c: c.data == "feedback")
+def feedback_cb(call):
+    feedback_mode.add(call.from_user.id)
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.from_user.id, "Apna feedback bhejo! Kaise laga? 😊")
+
+@bot.message_handler(func=lambda m: m.from_user.id in feedback_mode, content_types=["text", "photo", "video", "document"])
+def feedback_msg(message):
+    feedback_mode.discard(message.from_user.id)
+    bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+    bot.send_message(
+        ADMIN_ID,
+        f"Feedback from @{message.from_user.username} (ID: {message.from_user.id})"
+    )
+    bot.reply_to(message, "Your feedback sent to admin. Thanks! ❤️")
+
+# ===========================
+# GENERAL TEXT HANDLER
+# ===========================
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def text_handler(message):
+    if not private_only(message):
+        return
+    known_users.add(message.from_user.id)
+    if not must_join_check(message):
+        return
+
+    if temp_broadcast["active"]:
+        bot.send_message(
+            message.chat.id,
+            temp_broadcast["text"],
+            reply_markup=feedback_button()
+        )
+
+    if giveaway["active"] and message.text.lower() == "yes":
+        giveaway["participants"].add(message.from_user.id)
+        bot.reply_to(message, "Participated successfully! 😍🥳")
+        log_admin(f"User @{message.from_user.username} (ID: {message.from_user.id}) ne participated kia.")
+
+# ===========================
+# START BOT
+# ===========================
+print("Bot running...")
+bot.infinity_polling(skip_pending=True)
